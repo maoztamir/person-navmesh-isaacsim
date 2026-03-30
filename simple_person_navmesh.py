@@ -1,34 +1,27 @@
 """
 =============================================================================
-  Isaac Sim 5.1 — Simple Person NavMesh Navigation Example
+  Isaac Sim 5.1 — Simple Person Random NavMesh Navigation Example
 =============================================================================
 
   WHAT YOU WILL SEE
   -----------------
-  One person walks a large loop that covers the ENTIRE warehouse floor,
-  automatically following the Navigation Mesh (NavMesh) so they never
-  walk through walls or shelves.
+  One person walks randomly around the ENTIRE warehouse floor forever.
+  Every destination is a random point on the NavMesh, so the character
+  automatically covers the whole walkable area and never repeats the
+  same route twice.
 
   HOW TO RUN
   ----------
   Isaac Sim  →  Window  →  Script Editor  →  Open this file  →  Ctrl+Enter
 
-  KEY CONCEPTS (explained below with the code)
+  HOW IT WORKS
   ------------
-  NavMesh     : A map of every spot in the scene that a person can walk on.
-                IRA bakes it at startup from the scene geometry and uses it
-                to find obstacle-free paths between any two positions.
-
-  IRA         : isaacsim.replicator.agent — Isaac Sim's built-in system for
-                placing and animating humanoid characters. Given a scene +
-                command list it handles spawning, NavMesh pathfinding, and
-                walk/idle animations automatically.
-
-  Command file: A plain-text list of instructions per character.
-                  GoTo  x  y  z  _   → walk to world position via NavMesh
-                  Idle  t             → stand still for t seconds
-                  LookAround  t       → look around naturally for t seconds
-                The list loops automatically so the person walks forever.
+  1. The warehouse scene is loaded (it already has a NavMesh volume).
+  2. IRA bakes the NavMesh from the scene geometry at startup.
+  3. generate_random_commands() queries the NavMesh for random walkable
+     points and produces a list of GoTo / Idle / LookAround commands.
+  4. These commands are saved to a file that CharacterBehavior reads.
+  5. The timeline plays — the character walks the random route and loops.
 
 =============================================================================
 """
@@ -38,133 +31,73 @@ import os
 
 import carb.eventdispatcher
 import omni.timeline
-import yaml  # bundled with Isaac Sim
+import yaml
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SETTINGS — change these to match your environment
+#  SETTINGS
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Root folder where Isaac Sim assets live on this machine.
 ASSETS_ROOT = "/home/ubuntu/isaacsim_assets/Assets/Isaac/5.1"
 
-# The warehouse USD — this file already has a NavMesh volume baked inside it.
-SCENE_USD = f"{ASSETS_ROOT}/Isaac/Environments/Simple_Warehouse/full_warehouse.usd"
-
-# Folder containing humanoid character USD assets.
+SCENE_USD         = f"{ASSETS_ROOT}/Isaac/Environments/Simple_Warehouse/full_warehouse.usd"
 CHARACTERS_FOLDER = f"{ASSETS_ROOT}/Isaac/People/Characters/"
 
+# How many frames of random commands to generate (30 fps).
+# These commands loop automatically, so 600 frames (20 s) of waypoints
+# is enough — the character will re-walk the random route on each loop.
+COMMAND_FRAMES = 600
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  STEP 1 — Enable IRA (the people-navigation extension)
+#  STEP 1 — Enable IRA
 # ─────────────────────────────────────────────────────────────────────────────
 from isaacsim.core.utils.extensions import enable_extension
 
 enable_extension("isaacsim.replicator.agent.core")
 
-# Must import AFTER enabling the extension
 from isaacsim.replicator.agent.core.simulation import SimulationManager
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STEP 2 — Write the command files
+#  STEP 2 — Write supporting files
 #
-#  IMPORTANT: IRA reads the command file during every loop of the simulation,
-#  not just at startup. The files must stay on disk the entire time the
-#  simulation is running. We write them next to this script so they persist.
+#  The command file is initially empty — it will be filled with random
+#  NavMesh waypoints AFTER the NavMesh is baked (step 4 below).
+#  It must stay on disk for the entire simulation (CharacterBehavior
+#  re-reads it on every loop).
 # ─────────────────────────────────────────────────────────────────────────────
-
-# Directory this script lives in — we write supporting files here.
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-# ── Character movement commands ───────────────────────────────────────────────
-#  Waypoints cover EVERY AREA of the warehouse:
-#    east/west aisles, far north, far south, corners, centre.
-#
-#  IRA uses the NavMesh to find the walkable path between each GoTo point
-#  automatically routing around shelves and walls.
-#
-#  The list loops forever — the person never stops walking.
-# ─────────────────────────────────────────────────────────────────────────────
-CHARACTER_COMMANDS = """\
-# One person walks a large loop covering the entire warehouse floor.
-# IRA routes around shelves automatically on each GoTo via the NavMesh.
-# This command list loops forever — the person never stops.
-
-Character LookAround 2.0
-Character GoTo   1.24    5.79  0.0  _
-Character Idle   1.5
-
-Character GoTo   4.61   -5.82  0.0  _
-Character LookAround 2.0
-
-Character GoTo   2.55  -16.60  0.0  _
-Character Idle   2.0
-
-Character GoTo  -14.52  -22.38  0.0  _
-Character LookAround 2.5
-
-Character GoTo  -19.24  -12.59  0.0  _
-Character Idle   1.5
-
-Character GoTo  -23.32   -2.37  0.0  _
-Character LookAround 2.0
-
-Character GoTo  -16.76   -4.85  0.0  _
-Character Idle   1.0
-
-Character GoTo   -1.28    5.08  0.0  _
-Character LookAround 2.0
-
-Character GoTo  -11.16    7.25  0.0  _
-Character Idle   1.5
-
-Character GoTo   -3.04   24.90  0.0  _
-Character LookAround 3.0
-
-Character GoTo    1.41   24.04  0.0  _
-Character Idle   2.0
-"""
-
-# ── Robot command file (empty — no robots in this example) ───────────────────
-#  IRA always looks for a robot command file. Providing an empty one
-#  avoids the "Unable to set up robot command file: None" error.
-ROBOT_COMMANDS = "# No robots in this example\n"
-
-# Write files to the script directory so they survive for the whole session
+HERE           = os.path.dirname(os.path.abspath(__file__))
 CMD_PATH       = os.path.join(HERE, "_person_commands.txt")
 ROBOT_CMD_PATH = os.path.join(HERE, "_robot_commands.txt")
 CFG_PATH       = os.path.join(HERE, "_ira_config.yaml")
 
-with open(CMD_PATH,       "w") as f: f.write(CHARACTER_COMMANDS)
-with open(ROBOT_CMD_PATH, "w") as f: f.write(ROBOT_COMMANDS)
+# Placeholder — will be overwritten with real random commands after NavMesh bake
+with open(CMD_PATH,       "w") as f: f.write("# random commands will be written here\n")
+with open(ROBOT_CMD_PATH, "w") as f: f.write("# no robots\n")
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STEP 3 — Build and write the IRA configuration
-# ─────────────────────────────────────────────────────────────────────────────
-#  IRA is configured via a YAML file. These are the minimum fields needed
-#  to spawn one person and have them walk around.
+#  STEP 3 — Write IRA config
 # ─────────────────────────────────────────────────────────────────────────────
 ira_config = {
     "isaacsim.replicator.agent": {
         "version": "0.7.0",
         "global": {
             "seed": 42,
-            "simulation_length": 99999,   # very large → runs until you stop it
+            # simulation_length controls how many frames of random commands
+            # generate_random_commands() will produce. Commands loop after
+            # this many frames, so the character keeps walking forever.
+            "simulation_length": COMMAND_FRAMES,
         },
         "scene": {
-            # Warehouse USD that already contains a NavMesh volume.
-            # IRA rebakes the NavMesh at startup from this geometry,
-            # then uses it to route the character around shelves/walls.
             "asset_path": SCENE_USD,
         },
         "character": {
-            "asset_path":      CHARACTERS_FOLDER,  # IRA picks one character from here
-            "command_file":    CMD_PATH,            # walk/idle instructions (step 2)
+            "asset_path":      CHARACTERS_FOLDER,
+            "command_file":    CMD_PATH,   # filled with random waypoints in step 4
             "filters":         [],
-            "navigation_area": [],                  # [] = use the full NavMesh
-            "spawn_area":      [],                  # [] = spawn anywhere on NavMesh
-            "num": 1,                              # spawn exactly 1 person
+            "navigation_area": [],         # [] = use the entire NavMesh
+            "spawn_area":      [],         # [] = spawn anywhere on the NavMesh
+            "num": 1,
         },
         "robot": {
-            # No robots — but IRA still needs a command_file entry (even empty).
             "command_file":    ROBOT_CMD_PATH,
             "nova_carter_num": 0,
             "transporter_num": 0,
@@ -173,7 +106,7 @@ ira_config = {
             "navigation_area": [],
             "write_data":      False,
         },
-        "write_data": False,   # set True to save RGB + bounding-box data to disk
+        "write_data": False,
     }
 }
 
@@ -181,53 +114,49 @@ with open(CFG_PATH, "w") as f:
     yaml.dump(ira_config, f)
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STEP 4 — Set up and start the simulation
-# ─────────────────────────────────────────────────────────────────────────────
-#  IRA's setup is asynchronous (opening a large USD takes time), so we
-#  schedule it with asyncio, which Isaac Sim's Script Editor supports.
+#  STEP 4 — Run the simulation
 # ─────────────────────────────────────────────────────────────────────────────
 async def run():
-
-    # Create the SimulationManager and load our config.
-    # SimulationManager is IRA's core class — it orchestrates everything:
-    #   • opens the scene USD
-    #   • bakes the NavMesh from scene geometry
-    #   • spawns the character at a random walkable position
-    #   • loads our command file so the character knows where to walk
     sim = SimulationManager()
+
     ok = sim.load_config_file(CFG_PATH)
     if not ok:
-        print("[NavExample] ERROR: Config failed to load. Check the ASSETS_ROOT path at the top of this file.")
+        print("[NavExample] ERROR: Config failed to load — check ASSETS_ROOT.")
         return
 
-    # set_up_simulation_from_config_file() is non-blocking — it fires the
-    # SET_UP_SIMULATION_DONE_EVENT when the scene + NavMesh + characters
-    # are all ready. We use an asyncio.Event to wait for it.
+    # Wait for scene load + NavMesh bake + character spawn
     setup_done = asyncio.Event()
-
-    def on_setup_done(_event):
-        setup_done.set()
-
-    _sub = sim.register_set_up_simulation_done_callback(on_setup_done)
+    _sub = sim.register_set_up_simulation_done_callback(lambda _: setup_done.set())
 
     print("[NavExample] Loading scene and baking NavMesh …")
     sim.set_up_simulation_from_config_file()
+    await setup_done.wait()
+    _sub = None
 
-    await setup_done.wait()   # wait for scene + NavMesh + character to be ready
-    _sub = None               # release the event subscription
+    # ── Generate random waypoints using the live NavMesh ────────────────────
+    #  generate_random_commands() queries the NavMesh for random walkable
+    #  points and returns a list of GoTo / Idle / LookAround command strings.
+    #  Every point is guaranteed to be reachable — the NavMesh ensures that.
+    #  The list covers the entire walkable area of the warehouse.
+    print("[NavExample] Generating random waypoints from NavMesh …")
+    random_commands = await sim.generate_random_commands()
 
-    # Play the timeline — this starts the physics + animation loop.
-    # The CharacterBehavior script attached to the person will read
-    # our command file and begin walking immediately.
-    #
-    # NOTE: The command files in this directory must NOT be deleted while
-    # the simulation is running — CharacterBehavior re-reads them each loop.
-    print("[NavExample] Setup complete — starting simulation!")
-    print("[NavExample]   The person is now walking around the warehouse.")
-    print("[NavExample]   Stop the timeline to pause, close Isaac Sim to exit.")
-    print(f"[NavExample]   Command file: {CMD_PATH}\n")
+    if not random_commands:
+        print("[NavExample] WARNING: No random commands generated — NavMesh may be empty.")
+        print("[NavExample]   The character will still spawn but won't move.")
+    else:
+        print(f"[NavExample] Generated {len(random_commands)} random waypoints.")
+
+    # Save the random commands to the command file.
+    # CharacterBehavior will read this file when the timeline starts
+    # and loop through the waypoints forever.
+    sim.save_commands(random_commands)
+
+    # ── Start the simulation ─────────────────────────────────────────────────
+    print("[NavExample] Starting simulation — person walking randomly!")
+    print("[NavExample]   The route loops automatically — the person walks forever.")
+    print("[NavExample]   Stop the timeline to pause.\n")
     omni.timeline.get_timeline_interface().play()
 
 
-# Schedule on Isaac Sim's already-running async event loop
 asyncio.ensure_future(run())
