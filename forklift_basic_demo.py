@@ -210,7 +210,9 @@ async def main():
 
             desired = math.degrees(math.atan2(dy, dx))
             err     = (desired - _current_heading() + 180) % 360 - 180
-            sa      = max(-MAX_STEER, min(MAX_STEER, KP_STEER * err))
+            # ForkliftC has REAR-wheel steering: positive joint angle
+            # turns the vehicle RIGHT, so negate to match heading convention
+            sa      = max(-MAX_STEER, min(MAX_STEER, -KP_STEER * err))
             abs_err = abs(err)
 
             # Always keep minimum speed so steering actually works
