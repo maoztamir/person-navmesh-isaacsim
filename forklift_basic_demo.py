@@ -1,19 +1,22 @@
 """
 =============================================================================
-  Forklift Pallet Demo — Isaac Sim 5.1
+  Forklift Pallet Shuttle Demo — Isaac Sim 5.1
 =============================================================================
 
-  A physics-based ForkliftC robot:
-    1. Drives forward to a pallet                  (wheel joints)
-    2. Slides forks underneath and lifts the pallet (lift joint)
-    3. Drives the pallet to a new location          (wheel joints)
-    4. Lowers and places the pallet on the ground   (lift joint)
-    5. Reverses away                                (wheel joints)
+  A physics-based ForkliftC robot shuttles 4 pallets between two zones:
 
-  Uses the articulated ForkliftC robot with real physics joints:
-    - left/right_back_wheel_joint  → drive velocity
-    - left/right_rotator_joint     → steering angle
-    - lift_joint                   → fork height
+    Loading Zone  (yellow markers)  ←→  Staging Area  (blue markers)
+
+  Sequence:
+    1. Forklift picks up each pallet from the Loading Zone one at a time
+    2. Carries it to the Staging Area and sets it down
+    3. Once all pallets are in Staging, reverses direction back to Loading
+    4. Loops forever
+
+  Pallet carry uses kinematic attachment:
+    - Pallet RigidBody is set kinematic while being transported
+    - Position is updated every frame to follow the forklift's fork tips
+    - On drop, kinematic is released and physics takes over
 
   HOW TO RUN
   ----------
@@ -45,14 +48,14 @@ from pxr import Gf, Sdf, UsdGeom, UsdPhysics
 enable_extension("omni.anim.navigation.core")
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Asset paths — ForkliftC is the articulated robot version
+#  Asset paths
 # ─────────────────────────────────────────────────────────────────────────────
 ASSETS       = "/home/ubuntu/isaacsim_assets/Assets/Isaac/5.1"
 FORKLIFT_USD = f"{ASSETS}/Isaac/Robots/IsaacSim/ForkliftC/forklift_c.usd"
 PALLET_USD   = f"{ASSETS}/Isaac/Props/Pallet/pallet.usd"
 GROUND_USD   = f"{ASSETS}/Isaac/Environments/Grid/default_environment.usd"
 
-GRAPH = "/ForkliftGraph"   # OmniGraph controller path
+GRAPH = "/ForkliftGraph"
 
 
 async def main():
@@ -66,72 +69,68 @@ async def main():
     world = World(stage_units_in_meters=1.0)
     stage = omni.usd.get_context().get_stage()
 
-    # ── Load assets ─────────────────────────────────────────────────────────
-    # Ground plane — needed for physics (gravity, floor collision)
+    # ── Ground plane ────────────────────────────────────────────────────────
     add_reference_to_stage(GROUND_USD, "/World/Ground")
 
-    # ── NavMesh volume ───────────────────────────────────────────────────────
-    # Define a 20×20 m navigable area centred at the origin (Z up).
-    # NavSchema.NavMeshVolume marks the region the baker will treat as walkable.
+    # ── NavMesh volume (20×20 m, centred at (5, 0)) ─────────────────────────
     nav_vol = NavSchema.NavMeshVolume.Define(stage, Sdf.Path("/World/NavMeshVolume"))
     nav_vol.GetNavVolumeTypeAttr().Set("Include")
-    nav_boundable = UsdGeom.Boundable(nav_vol.GetPrim())
-    # Extent is in local units: half-extents for a 20×20×4 m box
-    nav_boundable.GetExtentAttr().Set(
+    UsdGeom.Boundable(nav_vol.GetPrim()).GetExtentAttr().Set(
         [Gf.Vec3f(-10.0, -10.0, -0.1), Gf.Vec3f(10.0, 10.0, 4.0)]
     )
     UsdGeom.Xformable(nav_vol.GetPrim()).AddTranslateOp().Set(Gf.Vec3d(5.0, 0.0, 0.0))
 
-    # ── Loading area — yellow marker band on the floor ───────────────────────
-    # 5 m × 4 m zone inside the NavMesh, centred at (8, 3).
-    # Four thin flat strips form the border; no physics so forklifts can enter.
-    ZONE_CX, ZONE_CY = 8.0, 3.0   # zone centre (world XY)
-    ZONE_W,  ZONE_D  = 5.0, 4.0   # zone width (X) × depth (Y)
-    STRIP_W          = 0.15        # band width in metres
-    STRIP_H          = 0.012       # band thickness (sits on floor)
-    YELLOW           = [Gf.Vec3f(1.0, 0.85, 0.0)]
+    # ── Zone marker bands ───────────────────────────────────────────────────
+    YELLOW = [Gf.Vec3f(1.0, 0.85, 0.0)]
+    BLUE   = [Gf.Vec3f(0.3, 0.8,  1.0)]
 
-    _zone_strips = [
-        # name       centre-X                    centre-Y                    scale-X         scale-Y
-        ("North", ZONE_CX,                   ZONE_CY + ZONE_D / 2,   ZONE_W / 2,     STRIP_W / 2),
-        ("South", ZONE_CX,                   ZONE_CY - ZONE_D / 2,   ZONE_W / 2,     STRIP_W / 2),
-        ("East",  ZONE_CX + ZONE_W / 2,      ZONE_CY,                 STRIP_W / 2,    ZONE_D / 2),
-        ("West",  ZONE_CX - ZONE_W / 2,      ZONE_CY,                 STRIP_W / 2,    ZONE_D / 2),
-    ]
-    for name, tx, ty, sx, sy in _zone_strips:
-        cube = UsdGeom.Cube.Define(stage, Sdf.Path(f"/World/LoadingZone/Strip_{name}"))
-        xf = UsdGeom.Xformable(cube.GetPrim())
-        xf.AddTranslateOp().Set(Gf.Vec3d(tx, ty, STRIP_H))
-        xf.AddScaleOp().Set(Gf.Vec3f(sx, sy, STRIP_H))   # Cube is unit [-1,1] so scale = half-size
-        cube.GetDisplayColorAttr().Set(YELLOW)
+    def create_zone(name, cx, cy, w, d, color):
+        """Draw a rectangular marker band on the floor (visual only, no collision)."""
+        STRIP_W, STRIP_H = 0.15, 0.012
+        strips = [
+            ("North", cx,       cy + d/2, w/2,      STRIP_W/2),
+            ("South", cx,       cy - d/2, w/2,      STRIP_W/2),
+            ("East",  cx + w/2, cy,       STRIP_W/2, d/2),
+            ("West",  cx - w/2, cy,       STRIP_W/2, d/2),
+        ]
+        for sname, tx, ty, sx, sy in strips:
+            cube = UsdGeom.Cube.Define(stage, Sdf.Path(f"/World/{name}/Strip_{sname}"))
+            xf   = UsdGeom.Xformable(cube.GetPrim())
+            xf.AddTranslateOp().Set(Gf.Vec3d(tx, ty, STRIP_H))
+            xf.AddScaleOp().Set(Gf.Vec3f(sx, sy, STRIP_H))
+            cube.GetDisplayColorAttr().Set(color)
 
-    # Articulated forklift — spawns at the origin, facing +X
+    create_zone("LoadingZone", 8.0,  3.0, 5.0, 4.0, YELLOW)
+    create_zone("StagingArea", 8.0, -4.0, 5.0, 4.0, BLUE)
+
+    # ── Forklift ────────────────────────────────────────────────────────────
     add_reference_to_stage(FORKLIFT_USD, "/World/Forklift")
 
-    # Pallet — placed 4 m ahead of the forklift in the +X direction
-    add_reference_to_stage(PALLET_USD, "/World/Pallet")
-    pallet_prim = stage.GetPrimAtPath(Sdf.Path("/World/Pallet"))
-    xformable = UsdGeom.Xformable(pallet_prim)
-    xformable.AddTranslateOp().Set(Gf.Vec3d(4.0, 0.0, 0.2))
-    # Rotate 90° around Z so the pallet's long side faces the forklift (+X)
-    xformable.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 90.0))
+    # ── Spawn 4 pallets in the Loading Zone ─────────────────────────────────
+    LOADING_SLOTS = [Gf.Vec3d(7.5, y, 0.0) for y in [1.5, 2.5, 3.5, 4.5]]
+    STAGING_SLOTS = [Gf.Vec3d(7.5, y, 0.0) for y in [-5.5, -4.5, -3.5, -2.5]]
 
-    # Give the pallet rigid-body physics so the forks can push it up
-    UsdPhysics.RigidBodyAPI.Apply(pallet_prim)
-    UsdPhysics.CollisionAPI.Apply(pallet_prim)
-    # Explicitly set convex hull so PhysX doesn't complain about triangle mesh on a dynamic body
-    UsdPhysics.MeshCollisionAPI.Apply(pallet_prim).CreateApproximationAttr().Set("convexHull")
-    mass = UsdPhysics.MassAPI.Apply(pallet_prim)
-    mass.CreateMassAttr(20.0)   # 20 kg
+    def spawn_pallets(slots):
+        prims = []
+        for i, slot in enumerate(slots):
+            path = Sdf.Path(f"/World/Pallet_{i}")
+            add_reference_to_stage(PALLET_USD, str(path))
+            prim = stage.GetPrimAtPath(path)
+            xf   = UsdGeom.Xformable(prim)
+            xf.AddTranslateOp().Set(Gf.Vec3d(slot[0], slot[1], 0.20))
+            xf.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 90.0))
+            UsdPhysics.RigidBodyAPI.Apply(prim)
+            UsdPhysics.CollisionAPI.Apply(prim)
+            UsdPhysics.MeshCollisionAPI.Apply(prim).CreateApproximationAttr().Set("convexHull")
+            UsdPhysics.MassAPI.Apply(prim).CreateMassAttr(20.0)
+            prims.append(prim)
+        return prims
+
+    pallet_prims = spawn_pallets(LOADING_SLOTS)
 
     await omni.kit.app.get_app().next_update_async()
 
     # ── OmniGraph controller ────────────────────────────────────────────────
-    # This is the same pattern NVIDIA uses in their official forklift test.
-    # The graph runs every simulation tick and writes joint commands:
-    #   - Wheel velocity via ArticulationController
-    #   - Steering angle via WritePrimAttribute on rotator joints
-    #   - Lift height  via WritePrimAttribute on lift joint
     keys = og.Controller.Keys
     og.Controller.edit(
         {"graph_path": GRAPH, "evaluator_name": "execution"},
@@ -157,7 +156,6 @@ async def main():
             keys.SET_VALUES: [
                 ("Steer.inputs:value", 0.0),
                 ("Lift.inputs:value",  0.0),
-                # Steering joints — control the turning angle
                 ("WriteSteerL.inputs:prim",
                     [usdrt.Sdf.Path("/World/Forklift/left_rotator_joint")]),
                 ("WriteSteerL.inputs:name",
@@ -166,12 +164,10 @@ async def main():
                     [usdrt.Sdf.Path("/World/Forklift/right_rotator_joint")]),
                 ("WriteSteerR.inputs:name",
                     "drive:angular:physics:targetPosition"),
-                # Lift joint — control the fork height
                 ("WriteLift.inputs:prim",
                     [usdrt.Sdf.Path("/World/Forklift/lift_joint")]),
                 ("WriteLift.inputs:name",
                     "drive:linear:physics:targetPosition"),
-                # Wheel joints — control the drive velocity
                 ("Articulation.inputs:robotPath",
                     "/World/Forklift"),
                 ("Articulation.inputs:velocityCommand",
@@ -186,186 +182,237 @@ async def main():
     omni.timeline.get_timeline_interface().set_time_codes_per_second(60)
     await world.initialize_simulation_context_async()
 
-    # ── Bake NavMesh now so it's visible before the demo starts ─────────────
-    print("[Forklift] Baking NavMesh …")
+    # ── Bake NavMesh ────────────────────────────────────────────────────────
+    print("[Shuttle] Baking NavMesh …")
     inav = nav.acquire_interface()
     inav.start_navmesh_baking()
-    for _ in range(1800):          # poll up to 30 s
+    for _ in range(1800):
         if inav.get_navmesh() is not None:
-            print("[Forklift] NavMesh ready — enable overlay: Window → Navigation → NavMesh → Show NavMesh")
+            print("[Shuttle] NavMesh ready. (Window → Navigation → NavMesh → Show NavMesh to visualise)")
             break
         await omni.kit.app.get_app().next_update_async()
     else:
-        print("[Forklift] WARNING: NavMesh bake timed out.")
+        print("[Shuttle] WARNING: NavMesh bake timed out.")
 
-    # ── Shorthand helpers ───────────────────────────────────────────────────
+    # ── Control helpers ──────────────────────────────────────────────────────
     def wheels(speed):
-        """Set both rear wheel velocities. Positive = forward (+X)."""
-        og.Controller.attribute(
-            f"{GRAPH}/Articulation.inputs:velocityCommand").set([speed, speed])
+        og.Controller.attribute(f"{GRAPH}/Articulation.inputs:velocityCommand").set([speed, speed])
 
     def steer(angle_deg):
-        """Set the steering angle on both rotator joints."""
-        og.Controller.attribute(
-            f"{GRAPH}/Steer.inputs:value").set(angle_deg)
+        og.Controller.attribute(f"{GRAPH}/Steer.inputs:value").set(angle_deg)
 
     def lift(height):
-        """Set the lift joint target position. 0 = ground, 1.0 = raised."""
-        og.Controller.attribute(
-            f"{GRAPH}/Lift.inputs:value").set(height)
+        og.Controller.attribute(f"{GRAPH}/Lift.inputs:value").set(height)
 
     async def wait(frames):
-        """Advance the simulation by N frames."""
         for _ in range(frames):
             await omni.kit.app.get_app().next_update_async()
 
-    # ── Start ───────────────────────────────────────────────────────────────
-    world.play()
-    await wait(10)   # let physics settle
-
-    # ── Demo sequence ───────────────────────────────────────────────────────
-
-    print("[Forklift] 1/7  Lowering forks to ground level …")
-    lift(0.0)
-    steer(0.0)
-    await wait(60)
-
-    print("[Forklift] 2/7  Driving forward — sliding forks under pallet …")
-    wheels(3.0)          # slower approach for precision
-    await wait(360)      # drive longer to get 90% under the pallet
-
-    print("[Forklift] 3/7  Stopping at pallet — lifting forks …")
-    wheels(0.0)
-    await wait(60)
-    lift(0.00)           # very low lift — barel off the ground
-    await wait(120)
-
-    print("[Forklift] 4/7  Transporting pallet to destination …")
-    wheels(5.0)
-    await wait(240)
-
-    print("[Forklift] 5/7  Stopping — lowering pallet …")
-    wheels(0.0)
-    await wait(60)
-    lift(0.0)
-    await wait(120)
-
-    print("[Forklift] 6/7  Reversing away …")
-    wheels(-5.0)
-    await wait(180)
-
-    print("[Forklift] 7/7  Stopping — done!")
-    wheels(0.0)
-    steer(0.0)
-    await wait(30)
-
-    print("[Forklift] Demo complete — starting NavMesh roam …")
-
-    navmesh = inav.get_navmesh()   # already baked above
-    if navmesh is None:
-        print("[Forklift] NavMesh not available — roam will use random XY fallback.")
-
-    print("[Forklift] NavMesh ready — starting waypoint roam …")
-
-    # ── Forklift state for NavMesh roam ─────────────────────────────────────
-    # We track heading and position manually since the articulated robot's
-    # transform is driven by physics — read it from the prim each frame.
-    DRIVE_SPEED   = 4.0   # m/s forward
-    MAX_STEER     = 22.0  # max steering angle (degrees) — physical limit of ForkliftC
-    KP_STEER      = 0.4   # proportional gain: steer_angle = KP * heading_error
-    WAYPOINT_DIST = 2.0   # m — switch to next waypoint when this close
-    AGENT_RADIUS  = 0.6   # m
-
+    # ── Position utilities ───────────────────────────────────────────────────
     forklift_prim = stage.GetPrimAtPath(Sdf.Path("/World/Forklift"))
-    forklift_xform = UsdGeom.Xformable(forklift_prim)
 
     def get_forklift_pos():
-        """Return current world XY position of the forklift."""
-        xform_cache = UsdGeom.XformCache()
-        mat = xform_cache.GetLocalToWorldTransform(forklift_prim)
-        t = mat.ExtractTranslation()
+        mat = UsdGeom.XformCache().GetLocalToWorldTransform(forklift_prim)
+        t   = mat.ExtractTranslation()
         return Gf.Vec3d(t[0], t[1], 0.0)
 
-    async def drive_to_waypoint(target: Gf.Vec3d):
-        """Steer and drive toward a single XY waypoint, stop when close."""
+    def get_prim_position(prim):
+        mat = UsdGeom.XformCache().GetLocalToWorldTransform(prim)
+        t   = mat.ExtractTranslation()
+        return Gf.Vec3d(t[0], t[1], t[2])
+
+    def set_prim_position(prim, pos):
+        xf  = UsdGeom.Xformable(prim)
+        for op in xf.GetOrderedXformOps():
+            if "translate" in op.GetOpName():
+                op.Set(pos)
+                return
+
+    # ── Shuttle constants ────────────────────────────────────────────────────
+    SLOT_X         = 7.5
+    APPROACH_X     = 5.0     # park here, face +X, then creep east to SLOT_X
+    REVERSE_X      = 4.0     # back up to here after depositing
+    FORK_LOW       = 0.0
+    FORK_CARRY     = 0.15    # just clears the floor
+    CREEP_SPEED    = 2.0     # m/s for fine legs
+    CARRY_SPEED    = 3.0     # m/s while carrying
+    CARRY_OFFSET_X = 1.5     # metres ahead of forklift body (fork tips)
+    CARRY_OFFSET_Z = 0.30    # metres up during transport
+    FINE_STOP_DIST = 0.25    # tight arrival threshold for straight-line legs
+    WAYPOINT_DIST  = 2.0     # coarse arrival threshold for NavMesh legs
+    MAX_STEER      = 22.0
+    KP_STEER       = 0.4
+
+    # ── Carry attachment ─────────────────────────────────────────────────────
+    def _update_carried_pallet(pallet_prim):
+        """Move the kinematic pallet to the forklift's fork-tip position."""
+        mat = UsdGeom.XformCache().GetLocalToWorldTransform(forklift_prim)
+        fwd = mat.GetRow3(0)
+        t   = mat.ExtractTranslation()
+        set_prim_position(pallet_prim, Gf.Vec3d(
+            t[0] + fwd[0] * CARRY_OFFSET_X,
+            t[1] + fwd[1] * CARRY_OFFSET_X,
+            CARRY_OFFSET_Z,
+        ))
+
+    # ── Heading helpers ──────────────────────────────────────────────────────
+    def _current_heading():
+        mat = UsdGeom.XformCache().GetLocalToWorldTransform(forklift_prim)
+        fwd = mat.GetRow3(0)
+        return math.degrees(math.atan2(fwd[1], fwd[0]))
+
+    async def align_to_x_axis(tolerance_deg=5.0):
+        """Steer in place until forklift faces +X (heading ≈ 0°)."""
+        while True:
+            err = (-_current_heading() + 180) % 360 - 180
+            if abs(err) < tolerance_deg:
+                wheels(0.0)
+                steer(0.0)
+                break
+            steer(max(-MAX_STEER, min(MAX_STEER, KP_STEER * err)))
+            wheels(0.0)
+            await omni.kit.app.get_app().next_update_async()
+
+    # ── Navigation helpers ───────────────────────────────────────────────────
+    async def drive_to_waypoint(target, cargo=None):
+        """
+        Drive to an XY target using proportional heading control.
+        If cargo prim is supplied, its kinematic position is updated each frame.
+        """
         while True:
             pos = get_forklift_pos()
-            dx = target[0] - pos[0]
-            dy = target[1] - pos[1]
-            dist = math.sqrt(dx * dx + dy * dy)
+            dx  = target[0] - pos[0]
+            dy  = target[1] - pos[1]
+            dist = math.sqrt(dx*dx + dy*dy)
             if dist < WAYPOINT_DIST:
                 break
 
-            # Desired heading in degrees (Isaac: X forward = 0°, Y left = 90°)
-            desired_heading = math.degrees(math.atan2(dy, dx))
-
-            # Read current forklift heading from transform
-            xform_cache = UsdGeom.XformCache()
-            mat = xform_cache.GetLocalToWorldTransform(forklift_prim)
-            fwd = mat.GetRow3(0)   # local X axis = forward direction of forklift
-            current_heading = math.degrees(math.atan2(fwd[1], fwd[0]))
-
-            heading_err = desired_heading - current_heading
-            # Normalise to [-180, 180]
-            heading_err = (heading_err + 180) % 360 - 180
-
-            # Proportional steering — small error = small steer angle
-            steer_angle = max(-MAX_STEER, min(MAX_STEER, KP_STEER * heading_err))
-
-            # Slow down proportionally to heading error so it can turn in place
-            abs_err = abs(heading_err)
-            if abs_err > 120:
-                speed = 0.0   # stop and steer to face destination first
-            elif abs_err > 60:
-                speed = 1.5
-            elif abs_err > 30:
-                speed = 2.5
-            else:
-                speed = DRIVE_SPEED
-
+            desired  = math.degrees(math.atan2(dy, dx))
+            err      = (desired - _current_heading() + 180) % 360 - 180
+            sa       = max(-MAX_STEER, min(MAX_STEER, KP_STEER * err))
+            abs_err  = abs(err)
+            speed    = (0.0 if abs_err > 120 else
+                        1.5 if abs_err > 60  else
+                        2.5 if abs_err > 30  else
+                        CARRY_SPEED if cargo else 4.0)
             wheels(speed)
-            steer(steer_angle)
+            steer(sa)
+
+            if cargo:
+                _update_carried_pallet(cargo)
             await omni.kit.app.get_app().next_update_async()
 
         wheels(0.0)
         steer(0.0)
 
-    # ── NavMesh roam loop ────────────────────────────────────────────────────
-    while True:
-        # Pick a random destination on the NavMesh
-        if navmesh is not None:
-            goal_pt = navmesh.query_random_point()
-            if goal_pt is None:
-                # Fallback: random point in the nav area
-                goal_pt = carb.Float3(
-                    random.uniform(-5.0, 15.0),
-                    random.uniform(-8.0, 8.0),
-                    0.0,
-                )
-        else:
-            goal_pt = carb.Float3(
-                random.uniform(-5.0, 15.0),
-                random.uniform(-8.0, 8.0),
-                0.0,
-            )
+    # ── Pickup / drop sequences ──────────────────────────────────────────────
+    async def approach_and_pickup(pallet_prim, slot_pos):
+        """Navigate to slot, slide forks under pallet, lift, go kinematic."""
+        slot_y = slot_pos[1]
 
-        goal = Gf.Vec3d(goal_pt[0], goal_pt[1], 0.0)
-        print(f"[Forklift] Roam → ({goal[0]:.1f}, {goal[1]:.1f})")
+        print(f"[Shuttle]   → approach ({APPROACH_X:.1f}, {slot_y:.1f})")
+        await drive_to_waypoint(Gf.Vec3d(APPROACH_X, slot_y, 0.0))
 
-        # Get a path along the NavMesh if available
-        if navmesh is not None:
-            pos = get_forklift_pos()
-            start = carb.Float3(pos[0], pos[1], 0.0)
-            path = navmesh.query_shortest_path(start, goal_pt, agent_radius=AGENT_RADIUS)
-            waypoints = [Gf.Vec3d(p[0], p[1], 0.0) for p in path.get_points()] if path else [goal]
-        else:
-            waypoints = [goal]
+        print("[Shuttle]   → aligning to +X")
+        await align_to_x_axis(tolerance_deg=3.0)
 
-        for wp in waypoints:
-            await drive_to_waypoint(wp)
-
-        # Brief pause at destination
+        print("[Shuttle]   → lowering forks")
+        lift(FORK_LOW)
         await wait(60)
+
+        print("[Shuttle]   → creeping under pallet")
+        while True:
+            pos = get_forklift_pos()
+            if abs(pos[0] - SLOT_X) < FINE_STOP_DIST:
+                break
+            wheels(CREEP_SPEED)
+            steer(0.0)
+            await omni.kit.app.get_app().next_update_async()
+        wheels(0.0)
+        await wait(30)
+
+        print("[Shuttle]   → lifting")
+        lift(FORK_CARRY)
+        await wait(90)
+
+        UsdPhysics.RigidBodyAPI(pallet_prim).GetKinematicEnabledAttr().Set(True)
+
+    async def carry_and_drop(pallet_prim, dest_slot_pos):
+        """Drive to destination carrying the pallet, deposit, and reverse."""
+        dest_y = dest_slot_pos[1]
+
+        print(f"[Shuttle]   → carrying to approach ({APPROACH_X:.1f}, {dest_y:.1f})")
+        await drive_to_waypoint(Gf.Vec3d(APPROACH_X, dest_y, 0.0), cargo=pallet_prim)
+
+        print("[Shuttle]   → aligning to +X at destination")
+        await align_to_x_axis(tolerance_deg=3.0)
+
+        print("[Shuttle]   → creeping to deposit position")
+        while True:
+            pos = get_forklift_pos()
+            if abs(pos[0] - SLOT_X) < FINE_STOP_DIST:
+                break
+            wheels(CREEP_SPEED)
+            steer(0.0)
+            _update_carried_pallet(pallet_prim)
+            await omni.kit.app.get_app().next_update_async()
+        wheels(0.0)
+        await wait(30)
+
+        print("[Shuttle]   → lowering pallet")
+        lift(FORK_LOW)
+        await wait(90)
+
+        # Snap pallet to slot, release physics
+        set_prim_position(pallet_prim,
+            Gf.Vec3d(dest_slot_pos[0], dest_slot_pos[1], 0.20))
+        UsdPhysics.RigidBodyAPI(pallet_prim).GetKinematicEnabledAttr().Set(False)
+        await wait(60)
+
+        print("[Shuttle]   → reversing away")
+        while True:
+            pos = get_forklift_pos()
+            if pos[0] < REVERSE_X:
+                break
+            wheels(-CREEP_SPEED)
+            steer(0.0)
+            await omni.kit.app.get_app().next_update_async()
+        wheels(0.0)
+        await wait(30)
+
+    # ── Start ────────────────────────────────────────────────────────────────
+    world.play()
+    await wait(30)   # let physics settle
+
+    # ── Shuttle state machine ────────────────────────────────────────────────
+    loading_pallets = list(range(4))   # pallet indices currently in Loading Zone
+    staging_pallets = []               # pallet indices currently in Staging Area
+
+    print("[Shuttle] Starting pallet shuttle. Loading Zone → Staging Area.")
+
+    while True:
+        if loading_pallets:
+            idx       = loading_pallets.pop(0)
+            src_slot  = LOADING_SLOTS[idx]
+            dest_slot = STAGING_SLOTS[idx]
+            print(f"[Shuttle] Pallet {idx}: Loading({src_slot[1]:.1f}) → Staging({dest_slot[1]:.1f})")
+            await approach_and_pickup(pallet_prims[idx], src_slot)
+            await carry_and_drop(pallet_prims[idx], dest_slot)
+            staging_pallets.append(idx)
+
+        elif staging_pallets:
+            print("[Shuttle] All pallets in Staging — reversing direction.")
+            idx       = staging_pallets.pop(0)
+            src_slot  = STAGING_SLOTS[idx]
+            dest_slot = LOADING_SLOTS[idx]
+            print(f"[Shuttle] Pallet {idx}: Staging({src_slot[1]:.1f}) → Loading({dest_slot[1]:.1f})")
+            await approach_and_pickup(pallet_prims[idx], src_slot)
+            await carry_and_drop(pallet_prims[idx], dest_slot)
+            loading_pallets.append(idx)
+
+        else:
+            # Both lists empty simultaneously — shouldn't happen, but guard anyway
+            await wait(60)
 
 
 asyncio.ensure_future(main())
