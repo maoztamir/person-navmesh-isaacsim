@@ -130,7 +130,14 @@ async def main():
 
     await omni.kit.app.get_app().next_update_async()
 
-    # ── OmniGraph controller ────────────────────────────────────────────────
+    # ── Initialize simulation first — must happen before OmniGraph creation ──
+    # world.initialize_simulation_context_async() resets the stage context and
+    # would destroy any OmniGraph nodes created before it runs.
+    omni.timeline.get_timeline_interface().set_time_codes_per_second(60)
+    await world.initialize_simulation_context_async()
+    await omni.kit.app.get_app().next_update_async()
+
+    # ── OmniGraph controller (created after world init so it isn't cleared) ──
     keys = og.Controller.Keys
     og.Controller.edit(
         {"graph_path": GRAPH, "evaluator_name": "execution"},
@@ -178,9 +185,7 @@ async def main():
         },
     )
 
-    # ── Initialize simulation ───────────────────────────────────────────────
-    omni.timeline.get_timeline_interface().set_time_codes_per_second(60)
-    await world.initialize_simulation_context_async()
+    await omni.kit.app.get_app().next_update_async()
 
     # ── Bake NavMesh ────────────────────────────────────────────────────────
     print("[Shuttle] Baking NavMesh …")
