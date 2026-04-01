@@ -117,7 +117,7 @@ async def main():
             add_reference_to_stage(PALLET_USD, str(path))
             prim = stage.GetPrimAtPath(path)
             xf   = UsdGeom.Xformable(prim)
-            xf.AddTranslateOp().Set(Gf.Vec3d(slot[0], slot[1], 0.20))
+            xf.AddTranslateOp().Set(Gf.Vec3d(slot[0], slot[1], 0.50))  # high enough to clear floor; physics settles them
             xf.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 90.0))
             UsdPhysics.RigidBodyAPI.Apply(prim)
             UsdPhysics.CollisionAPI.Apply(prim)
@@ -229,19 +229,21 @@ async def main():
                 return
 
     # ── Shuttle constants ────────────────────────────────────────────────────
-    SLOT_X         = 7.5
-    APPROACH_X     = 5.0     # park here, face +X, then creep east to SLOT_X
-    REVERSE_X      = 4.0     # back up to here after depositing
-    FORK_LOW       = 0.0
-    FORK_CARRY     = 0.15    # just clears the floor
-    CREEP_SPEED    = 2.0     # m/s for fine legs
-    CARRY_SPEED    = 3.0     # m/s while carrying
-    CARRY_OFFSET_X = 1.5     # metres ahead of forklift body (fork tips)
-    CARRY_OFFSET_Z = 0.30    # metres up during transport
-    FINE_STOP_DIST = 0.25    # tight arrival threshold for straight-line legs
-    WAYPOINT_DIST  = 2.0     # coarse arrival threshold for NavMesh legs
-    MAX_STEER      = 22.0
-    KP_STEER       = 0.4
+    SLOT_X          = 7.5
+    CARRY_OFFSET_X  = 1.5     # metres from forklift body to fork tips
+    PICKUP_BODY_X   = SLOT_X - CARRY_OFFSET_X   # 6.0 — body stop so tips are under pallet
+    APPROACH_X      = 3.0     # coarse nav target west of the slot row
+    REVERSE_X       = 2.0     # back-up stop after depositing
+    FORK_LOW        = 0.0
+    FORK_CARRY      = 0.15    # just clears the floor
+    CREEP_SPEED     = 2.0     # m/s for fine legs
+    CARRY_SPEED     = 3.0     # m/s while carrying
+    CARRY_OFFSET_Z  = 0.30    # metres up during transport
+    FINE_STOP_DIST  = 0.25    # tight arrival threshold for straight-line legs
+    WAYPOINT_DIST   = 1.5     # coarse arrival threshold for NavMesh legs
+    MAX_STEER       = 22.0
+    KP_STEER        = 0.4
+    AGENT_RADIUS    = 0.6
 
     # ── Carry attachment ─────────────────────────────────────────────────────
     def _update_carried_pallet(pallet_prim):
@@ -274,36 +276,57 @@ async def main():
             await omni.kit.app.get_app().next_update_async()
 
     # ── Navigation helpers ───────────────────────────────────────────────────
-    async def drive_to_waypoint(target, cargo=None):
+    async def _steer_to_point(target, cargo=None):
         """
-        Drive to an XY target using proportional heading control.
-        If cargo prim is supplied, its kinematic position is updated each frame.
+        Drive toward a single XY point until within WAYPOINT_DIST.
+        Updates kinematic cargo each frame if supplied.
         """
         while True:
-            pos = get_forklift_pos()
-            dx  = target[0] - pos[0]
-            dy  = target[1] - pos[1]
+            pos  = get_forklift_pos()
+            dx   = target[0] - pos[0]
+            dy   = target[1] - pos[1]
             dist = math.sqrt(dx*dx + dy*dy)
             if dist < WAYPOINT_DIST:
                 break
 
-            desired  = math.degrees(math.atan2(dy, dx))
-            err      = (desired - _current_heading() + 180) % 360 - 180
-            sa       = max(-MAX_STEER, min(MAX_STEER, KP_STEER * err))
-            abs_err  = abs(err)
-            speed    = (0.0 if abs_err > 120 else
-                        1.5 if abs_err > 60  else
-                        2.5 if abs_err > 30  else
-                        CARRY_SPEED if cargo else 4.0)
+            desired = math.degrees(math.atan2(dy, dx))
+            err     = (desired - _current_heading() + 180) % 360 - 180
+            sa      = max(-MAX_STEER, min(MAX_STEER, KP_STEER * err))
+            abs_err = abs(err)
+            speed   = (0.0 if abs_err > 120 else
+                       1.5 if abs_err > 60  else
+                       2.5 if abs_err > 30  else
+                       CARRY_SPEED if cargo else 4.0)
             wheels(speed)
             steer(sa)
-
             if cargo:
                 _update_carried_pallet(cargo)
             await omni.kit.app.get_app().next_update_async()
 
         wheels(0.0)
         steer(0.0)
+
+    async def drive_to_waypoint(target, cargo=None):
+        """
+        Navigate to target using NavMesh shortest path (stays on walkable area).
+        Falls back to straight-line if NavMesh is unavailable.
+        If cargo prim is supplied its kinematic position is updated each frame.
+        """
+        navmesh = inav.get_navmesh()
+        if navmesh is not None:
+            pos      = get_forklift_pos()
+            start_pt = carb.Float3(pos[0], pos[1], 0.0)
+            goal_pt  = carb.Float3(target[0], target[1], 0.0)
+            path     = navmesh.query_shortest_path(start_pt, goal_pt,
+                                                   agent_radius=AGENT_RADIUS)
+            if path:
+                wps = path.get_points()
+                for wp in wps:
+                    await _steer_to_point(Gf.Vec3d(wp[0], wp[1], 0.0), cargo)
+                return
+
+        # Fallback: direct drive
+        await _steer_to_point(target, cargo)
 
     # ── Pickup / drop sequences ──────────────────────────────────────────────
     async def approach_and_pickup(pallet_prim, slot_pos):
@@ -323,7 +346,7 @@ async def main():
         print("[Shuttle]   → creeping under pallet")
         while True:
             pos = get_forklift_pos()
-            if abs(pos[0] - SLOT_X) < FINE_STOP_DIST:
+            if abs(pos[0] - PICKUP_BODY_X) < FINE_STOP_DIST:
                 break
             wheels(CREEP_SPEED)
             steer(0.0)
@@ -350,7 +373,7 @@ async def main():
         print("[Shuttle]   → creeping to deposit position")
         while True:
             pos = get_forklift_pos()
-            if abs(pos[0] - SLOT_X) < FINE_STOP_DIST:
+            if abs(pos[0] - PICKUP_BODY_X) < FINE_STOP_DIST:
                 break
             wheels(CREEP_SPEED)
             steer(0.0)
@@ -365,7 +388,7 @@ async def main():
 
         # Snap pallet to slot, release physics
         set_prim_position(pallet_prim,
-            Gf.Vec3d(dest_slot_pos[0], dest_slot_pos[1], 0.20))
+            Gf.Vec3d(dest_slot_pos[0], dest_slot_pos[1], 0.15))  # just above floor; physics settles it
         UsdPhysics.RigidBodyAPI(pallet_prim).GetKinematicEnabledAttr().Set(False)
         await wait(60)
 
